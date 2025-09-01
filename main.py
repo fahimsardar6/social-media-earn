@@ -1,69 +1,59 @@
+import os
 import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from moviepy.editor import ImageClip, AudioFileClip
+from dotenv import load_dotenv
+import uuid
 
-# -------------------------------
-# CONFIGURATION
-# -------------------------------
+# Load environment variables locally (optional)
+load_dotenv()
+
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
-# Example: fetch one top headline
-NEWSAPI_URL = f"https://newsapi.org/v2/top-headlines?country=us&pageSize=1&apiKey={NEWSAPI_KEY}"
+app = FastAPI(title="News Video Generator")
 
-# Output filenames
-AUDIO_FILE = "speech.mp3"
-VIDEO_FILE = "news_video.mp4"
+# Request model
+class NewsRequest(BaseModel):
+    title: str = None
+    content: str = None
+    image_url: str = None
 
-# -------------------------------
-# 1. Fetch news from NewsAPI
-# -------------------------------
-response = requests.get(NEWSAPI_URL).json()
-article = response['articles'][0]
+# Endpoint to generate video
+@app.post("/generate-video")
+def generate_video(request: NewsRequest):
+    # Use default values if not provided
+    content = request.content or request.title or "No content provided"
+    image_url = request.image_url or "https://via.placeholder.com/720x480.png?text=News"
 
-title = article['title']
-content = article['description'] or article['content'] or title
-image_url = article['urlToImage']
+    # Generate speech via ElevenLabs
+    tts_url = "https://api.elevenlabs.io/v1/text-to-speech/alloy"
+    tts_headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json"
+    }
+    tts_data = {"text": content, "model": "eleven_monolingual_v1"}
+    tts_response = requests.post(tts_url, json=tts_data)
+    if tts_response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to generate speech")
+    
+    audio_file = f"audio_{uuid.uuid4().hex}.mp3"
+    with open(audio_file, "wb") as f:
+        f.write(tts_response.content)
 
-print(f"Title: {title}")
-print(f"Content: {content}")
-print(f"Image: {image_url}")
+    # Download image
+    img_file = f"image_{uuid.uuid4().hex}.jpg"
+    img_response = requests.get(image_url)
+    with open(img_file, "wb") as f:
+        f.write(img_response.content)
 
-# -------------------------------
-# 2. Generate speech using ElevenLabs
-# -------------------------------
-tts_url = "https://api.elevenlabs.io/v1/text-to-speech/YOUR_VOICE_ID"  # Replace with your voice ID
-tts_headers = {
-    "xi-api-key": ELEVENLABS_API_KEY,
-    "Content-Type": "application/json"
-}
-tts_data = {
-    "text": content,
-    "voice": "alloy",   # or your chosen voice
-    "model": "eleven_monolingual_v1"
-}
+    # Combine image + audio into video
+    audio_clip = AudioFileClip(audio_file)
+    image_clip = ImageClip(img_file).set_duration(audio_clip.duration)
+    image_clip = image_clip.resize(height=720)
+    video_file = f"video_{uuid.uuid4().hex}.mp4"
+    video_clip = image_clip.set_audio(audio_clip)
+    video_clip.write_videofile(video_file, fps=24, codec="libx264", audio_codec="aac")
 
-tts_response = requests.post(tts_url, json=tts_data)
-with open(AUDIO_FILE, "wb") as f:
-    f.write(tts_response.content)
-
-# -------------------------------
-# 3. Download news image
-# -------------------------------
-img_response = requests.get(image_url)
-img_file = "news_image.jpg"
-with open(img_file, "wb") as f:
-    f.write(img_response.content)
-
-# -------------------------------
-# 4. Combine image + audio to video
-# -------------------------------
-audio_clip = AudioFileClip(AUDIO_FILE)
-image_clip = ImageClip(img_file).set_duration(audio_clip.duration)
-
-# Optional: resize image
-image_clip = image_clip.resize(height=720)  # keeps aspect ratio
-
-video_clip = image_clip.set_audio(audio_clip)
-video_clip.write_videofile(VIDEO_FILE, fps=24)
-
-print("Video generated successfully!")
+    return {"video_file": video_file, "message": "Video generated successfully!"}
