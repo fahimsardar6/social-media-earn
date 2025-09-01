@@ -4,3 +4,5 @@ requests
 moviepy
 pydub
 python-dotenv
+sumy
+nltk
