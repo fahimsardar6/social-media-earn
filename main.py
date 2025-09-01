@@ -4,8 +4,8 @@ from moviepy.editor import ImageClip, AudioFileClip
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
-NEWSAPI_KEY = "e8539b3d350f4efab4bc22b1120bb9f9"
-ELEVENLABS_API_KEY = "sk_732746310255aa33db841f56e669577511b42b1dc91e17dc"
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
 # Example: fetch one top headline
 NEWSAPI_URL = f"https://newsapi.org/v2/top-headlines?country=us&pageSize=1&apiKey={NEWSAPI_KEY}"
