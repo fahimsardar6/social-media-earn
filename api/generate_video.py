@@ -1,72 +1,193 @@
-import os
-import requests
-from fastapi import FastAPI, Request, HTTPException
-from moviepy.editor import ImageClip, AudioFileClip
-import uuid
+import sys
+if sys.version_info >= (3, 12):
+    print("Warning: This application works best with Python 3.10 or 3.11")
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+import asyncio
+from functools import partial
+from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
+from moviepy.config import change_settings
+from newspaper import Article
+from newsapi import NewsApiClient
+from elevenlabs.client import ElevenLabs
+from elevenlabs import VoiceSettings
 from dotenv import load_dotenv
+import os
+import uuid
 
-# Summarization imports
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lsa import LsaSummarizer  # you can also try LexRank, Luhn, TextRank
-
-# Load .env locally
+# Load environment variables
 load_dotenv()
 
+# Optional BERT import
+try:
+    from summarizer import Summarizer
+    BERT_AVAILABLE = True
+except ImportError:
+    BERT_AVAILABLE = False
+    print("Warning: BERT summarizer not available. Full text will be used.")
+
+app = FastAPI()
+
+# 🔑 Keys
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
-# Download nltk data for sumy
-import nltk
-nltk.download("punkt")
-nltk.download("stopwords")
+# Init API clients
+newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
+eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-app = FastAPI(title="News Video Generator")
+# Configure MoviePy to use ImageMagick
+change_settings({"IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.1.2-Q16-HDRI\magick.exe"})
 
-VIDEO_FOLDER = "/tmp"
+# Initialize summarizer only if available
+model = Summarizer() if BERT_AVAILABLE else None
 
-def unique_filename(prefix, ext):
-    return f"{VIDEO_FOLDER}/{prefix}_{uuid.uuid4().hex}.{ext}"
 
-def summarize_text(text, sentence_count=2):
-    parser = PlaintextParser.from_string(text, Tokenizer("english"))
-    summarizer = LsaSummarizer()
-    summary = summarizer(parser.document, sentence_count)
-    return " ".join([str(sentence) for sentence in summary])
+def generate_elevenlabs_voice(text, filename):
+    """Generate voice using ElevenLabs SDK and save as MP3"""
+    try:
+        response = eleven_client.text_to_speech.convert(
+            text=text,
+            voice_id="pNInz6obpgDQGcFmaJgB",  # Adam voice
+            model_id="eleven_monolingual_v1",
+            output_format="mp3_22050_32",
+            voice_settings=VoiceSettings(
+                stability=0.0,
+                similarity_boost=1.0,
+                style=0.0,
+                use_speaker_boost=True,
+                speed=1.0,
+            ),
+        )
+        
+        with open(filename, "wb") as f:
+            for chunk in response:
+                if chunk:
+                    f.write(chunk)
+        return filename
+    except Exception as e:
+        raise Exception(f"ElevenLabs conversion failed: {str(e)}")
 
-@app.post("/generate-video")
-async def generate_video(request: Request):
-    data = await request.json()
-    raw_content = data.get("content") or data.get("title") or "No content provided"
-    image_url = data.get("image_url") or "https://via.placeholder.com/720x480.png?text=News"
 
-    # 0️⃣ Summarize the text using Sumy
-    content = summarize_text(raw_content, sentence_count=2)
+class VideoResponse(BaseModel):
+    message: str
+    video_title: str
+    video_file: str
+    article_url: str
+    content_type: str
+    content_length: int
 
-    # 1️⃣ Generate audio via ElevenLabs
-    tts_url = "https://api.elevenlabs.io/v1/text-to-speech/alloy"
-    tts_headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
-    tts_data = {"text": content, "model": "eleven_monolingual_v1"}
-    tts_response = requests.post(tts_url, json=tts_data)
-    if tts_response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to generate speech")
 
-    audio_file = unique_filename("audio", "mp3")
-    with open(audio_file, "wb") as f:
-        f.write(tts_response.content)
+@app.get("/")
+async def status():
+    return {"status": "API is running", "endpoints": ["/generate-video"]}
 
-    # 2️⃣ Download image
-    img_file = unique_filename("image", "jpg")
-    img_response = requests.get(image_url)
-    with open(img_file, "wb") as f:
-        f.write(img_response.content)
 
-    # 3️⃣ Combine image + audio into video
-    audio_clip = AudioFileClip(audio_file)
-    image_clip = ImageClip(img_file).set_duration(audio_clip.duration).resize(height=720)
-    video_file = unique_filename("video", "mp4")
-    video_clip = image_clip.set_audio(audio_clip)
-    video_clip.write_videofile(video_file, fps=24, codec="libx264", audio_codec="aac")
+def run_in_executor(func, *args):
+    """Run blocking functions in executor"""
+    loop = asyncio.get_event_loop()
+    return loop.run_in_executor(None, func, *args)
 
-    # 4️⃣ Return local file path (Vercel serverless cannot make it publicly accessible)
-    return {"video_file_path": video_file, "summary": content, "message": "Video generated successfully!"}
+@app.get("/generate-video", response_model=VideoResponse)
+async def generate_video(short: bool = False):
+    # Initialize resources to None
+    video = None
+    narration = None
+    txt_clip = None
+    final_video = None
+    audio_filename = None
+    output_filename = None
+
+    try:
+        # ✅ Step 1: Get latest BBC News headline
+        headlines = newsapi.get_top_headlines(sources="bbc-news", language="en", page_size=1)
+
+        if not headlines["articles"]:
+            raise HTTPException(status_code=404, detail="No news articles found")
+
+        article = headlines["articles"][0]
+        title = article["title"]
+        article_url = article["url"]
+
+        # ✅ Step 2: Extract full article
+        news_article = Article(article_url)
+        news_article.download()
+        news_article.parse()
+        content_full = news_article.text.strip()
+
+        if not content_full:
+            raise HTTPException(status_code=404, detail="No content extracted from article")
+
+        # ✅ Step 3: Summarize or keep full
+        if short and BERT_AVAILABLE and model:
+            content = model(content_full, min_length=40, max_length=100)
+        else:
+            content = content_full
+
+        # ✅ Step 4: Generate narration
+        audio_filename = f"temp/audio_{uuid.uuid4().hex}.mp3"
+        os.makedirs("temp", exist_ok=True)
+        generate_elevenlabs_voice(content, audio_filename)
+
+        # ✅ Step 5: Combine with static video
+        static_video_path = "static/static_background.mp4"
+        if not os.path.exists(static_video_path):
+            raise HTTPException(status_code=404, detail=f"Static video not found: {static_video_path}")
+
+        # Load and resize video for mobile (9:16 aspect ratio)
+        video = VideoFileClip(static_video_path).resize(newsize=(1080, 1920))
+        narration = AudioFileClip(audio_filename)
+
+        # Loop video if narration is longer
+        if narration.duration > video.duration:
+            loops_needed = int(narration.duration / video.duration) + 1
+            video_loops = [video] * loops_needed
+            final_video = concatenate_videoclips(video_loops).subclip(0, narration.duration)
+        else:
+            final_video = video.subclip(0, narration.duration)
+
+        # Add caption with font size and position adjusted for vertical video
+        txt_clip = (TextClip(title, 
+                             fontsize=50, 
+                             color='white',
+                             bg_color='rgba(0,0,0,0.5)',
+                             size=final_video.size, 
+                             method='caption',
+                             stroke_color='black',
+                             stroke_width=2)
+                     .set_position(('center', 'bottom'))
+                     .set_duration(final_video.duration))
+
+        # Combine video with caption
+        final_video = CompositeVideoClip([final_video, txt_clip])
+        final_video = final_video.set_audio(narration)
+        
+        output_filename = f"output/generated_{uuid.uuid4().hex}.mp4"
+        os.makedirs("output", exist_ok=True)
+        final_video.write_videofile(output_filename, codec="libx264", audio_codec="aac")
+
+        return {
+            "message": "Video generated successfully",
+            "video_title": title,
+            "video_file": output_filename,
+            "article_url": article_url,
+            "content_type": "summary" if short else "full",
+            "content_length": len(content),
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        # Clean up resources
+        try:
+            if txt_clip: txt_clip.close()
+            if narration: narration.close()
+            if video: video.close()
+            if final_video: final_video.close()
+            if audio_filename and os.path.exists(audio_filename):
+                os.remove(audio_filename)
+        except Exception as e:
+            print(f"Cleanup error: {e}")
